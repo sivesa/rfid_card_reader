@@ -11,6 +11,8 @@ import datetime
 from pathlib import Path
 from smartcard.System import readers
 from smartcard.util import toHexString, toBytes
+import time
+from smartcard.scard import SCARD_SHARE_DIRECT
 
 class EMVCardReader:
     def __init__(self, output_dir="emv_sessions"):
@@ -791,7 +793,189 @@ class EMVCardReader:
         print(f"\n   Session saved successfully: {session_dir}")
         return str(session_dir)
 
-    def read_card(self):
+    def wait_for_reader(self, timeout=30, poll_interval=1, required_name="ACR122U"):
+        """Poll until an ACS ACR122U reader is present, or timeout (0/None = wait forever)"""
+        print("\n" + "="*60)
+        print("WAITING FOR ACS ACR122U READER")
+        print("="*60)
+        start = time.time()
+        while True:
+            for r in readers():
+                if required_name in str(r).upper():
+                    print(f"✓ ACS ACR122U detected: {r}")
+                    return r
+            if timeout and (time.time() - start) >= timeout:
+                print(f"✗ No ACS ACR122U found after {timeout}s")
+                return None
+            print(f"  ...waiting for reader ({int(time.time() - start)}s elapsed)", end="\r")
+            time.sleep(poll_interval)
+
+    def display_reader_info(self, reader):
+        """Query the reader directly (no card required) and print identifying info"""
+        print(f"\nReader       : {reader}")
+        try:
+            direct_conn = reader.createConnection()
+            direct_conn.connect(mode=SCARD_SHARE_DIRECT)
+            apdu = [0xFF, 0x00, 0x48, 0x00, 0x00]
+            resp, sw1, sw2 = direct_conn.transmit(apdu)
+            if sw1 == 0x90 and sw2 == 0x00:
+                firmware = ''.join(chr(b) for b in resp if 32 <= b <= 126).strip()
+                print(f"Firmware     : {firmware}")
+            direct_conn.disconnect()
+        except Exception as e:
+            print(f"  (Could not query firmware before card insert: {e})")
+
+    def wait_for_card(self, reader, timeout=30, poll_interval=1):
+        """Poll until a card is presented to the reader, or timeout (0/None = wait forever)"""
+        print("\n" + "="*60)
+        print("WAITING FOR CARD ON ACS ACR122U")
+        print("="*60)
+        self.connection = reader.createConnection()
+        start = time.time()
+        while True:
+            try:
+                self.connection.connect(protocol=0)  # T=CL (contactless)
+                print("✓ Card detected and connected (contactless)")
+                return self.connection
+            except Exception:
+                if timeout and (time.time() - start) >= timeout:
+                    print(f"✗ No card presented within {timeout}s")
+                    return None
+                print(f"  ...waiting for card ({int(time.time() - start)}s elapsed)", end="\r")
+                time.sleep(poll_interval)
+
+
+    def read_card(self, reader_wait_timeout=30, card_wait_timeout=30):
+        """Main function to read the card - uses only ACS ACR122U"""
+        print(f" EMV Card Reader (Contactless with ACS ACR122U)")
+        print(f" Session started: {self.session_start}")
+        print(f" Output directory: {self.output_dir}")
+        print("-" * 60)
+        
+        try:
+            # Wait for ACS ACR122U PICC Interface 00 00 to be present
+            selected_reader = self.wait_for_reader(
+                timeout=reader_wait_timeout,
+                required_name="ACS ACR122U PICC INTERFACE 00 00"
+            )
+            if not selected_reader:
+                return None
+            
+            self.display_reader_info(selected_reader)
+            
+            # Wait for a card to be placed on the reader
+            if not self.wait_for_card(selected_reader, timeout=card_wait_timeout):
+                return None
+            
+            # Initialize ACS ACR122U for contactless communication
+            print("\n" + "="*60)
+            print("INITIALIZING ACS ACR122U")
+            print("="*60)
+
+            # Set buzzer off (optional, to avoid beeping)
+            try:
+                apdu = [0xFF, 0x00, 0x52, 0x00, 0x00]
+                resp, sw1, sw2 = self.send_apdu(apdu)
+                if sw1 == 0x90 and sw2 == 0x00:
+                    print("✓ Buzzer set to off")
+                else:
+                    print(f"  Warning: Failed to set buzzer: {hex(sw1)}{hex(sw2)}")
+            except Exception as e:
+                print(f"  Warning: Buzzer command failed, continuing: {e}")
+
+
+            # Set antenna power on
+            try:
+                apdu = [0xFF, 0x00, 0x00, 0x00, 0x04, 0xD4, 0x32, 0x01, 0x01]
+                resp, sw1, sw2 = self.send_apdu(apdu)
+                if sw1 == 0x90 and sw2 == 0x00:
+                    print("✓ Antenna power set to on")
+                else:
+                    print(f"  Warning: Failed to set antenna power: {hex(sw1)}{hex(sw2)}")
+            except Exception as e:
+                print(f"  Warning: Antenna command failed, continuing: {e}")
+
+
+            try:             
+                # Configure polling (enable ISO 14443 Type A)
+                apdu = [0xFF, 0x00, 0x00, 0x00, 0x05, 0xD4, 0x32, 0x02, 0x02, 0x00]
+                resp, sw1, sw2 = self.send_apdu(apdu)
+                if sw1 == 0x90 and sw2 == 0x00:
+                    print("✓ Polling configured for ISO 14443 Type A")
+                else:
+                    print(f"  Warning: Failed to configure polling: {hex(sw1)}{hex(sw2)}")
+                
+                # Get firmware version to verify reader functionality
+                apdu = [0xFF, 0x00, 0x48, 0x00, 0x00]
+                resp, sw1, sw2 = self.send_apdu(apdu)
+                if sw1 == 0x90 and sw2 == 0x00:
+                    firmware = ''.join(chr(b) for b in resp if 32 <= b <= 126).strip()
+                    print(f"✓ Reader firmware: {firmware}")
+                else:
+                    print(f"  Warning: Failed to get firmware: {hex(sw1)}{hex(sw2)}")
+            except Exception as e:
+                print(f"  Warning: Initialization failed: {e}")
+            
+            # Step 1: Select PPSE
+            ppse_resp = self.select_ppse()
+            if not ppse_resp:
+                print("✗ PPSE selection failed, attempting fallback AID...")
+                aid = [0xA0, 0x00, 0x00, 0x00, 0x03, 0x10, 0x10]  # Visa AID
+                select_resp = self.select_aid(aid)
+                if not select_resp:
+                    aid = [0xA0, 0x00, 0x00, 0x00, 0x04, 0x10, 0x10]
+                    select_resp = self.select_aid(aid)
+                    if not select_resp:
+                        return None
+            else:
+                aids = self.extract_aids_from_ppse(ppse_resp)
+                if not aids:
+                    print("✗ No applications found on card!")
+                    return None
+                aid = aids[0]
+                select_resp = self.select_aid(aid)
+                if not select_resp:
+                    return None
+            
+            fci_info = self.parse_fci_fixed(select_resp)
+            records = self.read_card_records()
+            cardholder_data = self.extract_cardholder_data_fixed(records)
+            session_path = self.save_session_files(fci_info, cardholder_data, records, aid)
+            
+            print(f"\n CARD READING COMPLETE!")
+            print(f" Data saved to: {session_path}")
+            print(f"\n{'='*60}")
+            print("FINAL SUMMARY")
+            print(f"{'='*60}")
+            print(f" Card: {fci_info.get('application_label', 'Unknown EMV Card')}")
+            print(f" Holder: {cardholder_data.get('cardholder_name', 'Not found')}")
+            print(f" Number: {cardholder_data.get('pan_masked', 'Not found')}")
+            print(f" Expires: {cardholder_data.get('expiry_date', 'Not found')}")
+            print(f" Language: {fci_info.get('language', 'Not specified')}")
+            print(f" Data: {sum(len(r['data']) for s in records.values() for r in s.values())} bytes")
+            
+            return {
+                'session_path': session_path,
+                'cardholder_data': cardholder_data,
+                'fci_info': fci_info,
+                'records_count': len([r for s in records.values() for r in s.values()])
+            }
+            
+        except Exception as e:
+            print(f" Error during card reading: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+        finally:
+            if self.connection:
+                try:
+                    self.connection.disconnect()
+                    print(" Card disconnected")
+                except Exception as e:
+                    print(f"  Disconnect warning: {e}")
+
+    @DeprecationWarning
+    def read_card_deprecated(self):
         """Main function to read the card - uses only ACS ACR122U"""
         print(f" EMV Card Reader (Contactless with ACS ACR122U)")
         print(f" Session started: {self.session_start}")
