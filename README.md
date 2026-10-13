@@ -11,7 +11,7 @@ This script connects to an RFID reader (e.g., ACS ACR122U) and reads data from a
 ### Prerequisites
 Before running the script, make sure you have the following software and hardware:
 - **ACS ACR122U RFID Reader** (or any PCSC-compatible RFID reader)
-- **Python 3.6+**
+- **Python versions >=3.9,<3.13 are supported**
 - **pyscard** library to interact with the RFID reader
 
 ### Steps to Install
@@ -19,6 +19,22 @@ Before running the script, make sure you have the following software and hardwar
 
    First, you'll need to install the `pyscard` library, which enables Python to communicate with the smartcard reader.
 
-   ```bash
-   pip install -r requiremens.txt
+```bash
+   sudo apt update
+   sudo apt install libpcsclite-dev pcscd swig gcc
+   sudo systemctl enable --now pcscd
+```
+   
+2. **Create and activate a Python 3.10 virtual environment:**
 
+```bash
+   python -m venv .rfid_env
+   source .rfid_env/bin/activate
+```
+
+3. **Install Python dependencies:**
+
+```bash
+   pip install --upgrade pip
+   pip install -r requirements.txt
+```
